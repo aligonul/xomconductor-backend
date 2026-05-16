@@ -15,6 +15,9 @@ app = Flask(__name__)
 
 anthropic_client = None
 
+MOCK_MODE = os.environ.get("ANTHROPIC_API_KEY", "").startswith("test_") or \
+            os.environ.get("MOCK_MODE", "").lower() == "true"
+
 
 def get_anthropic_client() -> Anthropic:
     """Get or create the Anthropic client singleton."""
@@ -22,6 +25,25 @@ def get_anthropic_client() -> Anthropic:
     if anthropic_client is None:
         anthropic_client = Anthropic()
     return anthropic_client
+
+
+def mock_draft_email(job_data: dict) -> dict:
+    case_type = job_data.get("case_type") or detect_case_type(job_data.get("vendor_note", ""))
+    customer = job_data.get("customer_name", "Valued Customer")
+    job_id = job_data.get("job_id", "N/A")
+    cm_name = job_data.get("cm_name", "Your Xometry Case Manager")
+    vendor_note = job_data.get("vendor_note", "")
+
+    subject = f"Update Regarding Your Order #{job_id}"
+    body = (
+        f"Dear {customer},\n\n"
+        f"Thank you for reaching out to Xometry. I wanted to follow up regarding your order #{job_id}.\n\n"
+        f"We have reviewed your request: \"{vendor_note[:120]}{'...' if len(vendor_note) > 120 else ''}\"\n\n"
+        f"Our team is actively working on this and will provide a full update shortly. "
+        f"Please don't hesitate to contact us if you have any questions in the meantime.\n\n"
+        f"Best regards,\n{cm_name}"
+    )
+    return {"subject": subject, "body": body, "case_type": case_type, "model": "mock"}
 
 
 @app.route("/health", methods=["GET"])
@@ -65,6 +87,17 @@ def extension_trigger():
                 "success": False,
                 "error": "vendor_note is required"
             }), 400
+
+        if MOCK_MODE:
+            result = mock_draft_email(job_data)
+            return jsonify({
+                "success": True,
+                "email_body": result["body"],
+                "subject": result["subject"],
+                "case_type": result["case_type"],
+                "full_response": f"Subject: {result['subject']}\n\n{result['body']}",
+                "mock": True,
+            })
 
         system_prompt = build_system_prompt(job_data)
 
