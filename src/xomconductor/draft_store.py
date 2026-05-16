@@ -11,12 +11,15 @@ class Draft:
     id: str
     case_number: str
     customer_name: str
+    customer_email: str
     subject: str
     body: str
     tone: str
     user_id: str
     channel_id: str
     message_ts: Optional[str] = None
+    sf_case_id: Optional[str] = None
+    issue_summary: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.now)
 
     @property
@@ -34,22 +37,28 @@ class DraftStore:
         self,
         case_number: str,
         customer_name: str,
+        customer_email: str,
         subject: str,
         body: str,
         tone: str,
         user_id: str,
         channel_id: str,
+        sf_case_id: Optional[str] = None,
+        issue_summary: Optional[str] = None,
     ) -> Draft:
         draft_id = str(uuid.uuid4())[:8]
         draft = Draft(
             id=draft_id,
             case_number=case_number,
             customer_name=customer_name,
+            customer_email=customer_email,
             subject=subject,
             body=body,
             tone=tone,
             user_id=user_id,
             channel_id=channel_id,
+            sf_case_id=sf_case_id,
+            issue_summary=issue_summary,
         )
         self._drafts[draft_id] = draft
         return draft

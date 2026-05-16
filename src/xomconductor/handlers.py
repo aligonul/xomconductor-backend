@@ -2,7 +2,7 @@
 
 from slack_bolt import App
 
-from . import blocks, claude_service
+from . import blocks, claude_service, salesforce_service
 from .config import config
 from .draft_store import store
 
@@ -10,14 +10,24 @@ from .draft_store import store
 def register_handlers(app: App) -> None:
     """Register all Slack handlers with the app."""
 
+    sf_enabled = salesforce_service.is_configured()
+
     @app.event("app_home_opened")
     def handle_app_home(client, event):
         """Update the App Home tab when opened."""
+        sf_connected = False
+        if sf_enabled:
+            try:
+                salesforce_service.get_client().connect()
+                sf_connected = True
+            except Exception:
+                pass
+
         client.views_publish(
             user_id=event["user"],
             view={
                 "type": "home",
-                "blocks": blocks.home_tab_blocks(),
+                "blocks": blocks.home_tab_blocks(sf_connected=sf_connected),
             },
         )
 
@@ -27,7 +37,7 @@ def register_handlers(app: App) -> None:
         ack()
         client.views_open(
             trigger_id=body["trigger_id"],
-            view=blocks.case_input_modal(),
+            view=blocks.case_input_modal(sf_enabled=sf_enabled),
         )
 
     @app.action("open_draft_modal")
@@ -36,8 +46,101 @@ def register_handlers(app: App) -> None:
         ack()
         client.views_open(
             trigger_id=body["trigger_id"],
-            view=blocks.case_input_modal(),
+            view=blocks.case_input_modal(sf_enabled=sf_enabled),
         )
+
+    @app.action("open_case_lookup")
+    def handle_open_case_lookup(ack, body, client):
+        """Open case lookup modal."""
+        ack()
+        client.views_open(
+            trigger_id=body["trigger_id"],
+            view=blocks.case_lookup_modal(),
+        )
+
+    @app.view("case_lookup_modal")
+    def handle_case_lookup_submit(ack, body, client, view):
+        """Handle case lookup submission."""
+        ack()
+
+        search_term = view["state"]["values"]["case_search_block"]["case_search"]["value"]
+        user_id = body["user"]["id"]
+        channel_id = config.slack_channel_id
+
+        if not sf_enabled:
+            client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text="Salesforce is not configured. Please add SF credentials to your .env file.",
+            )
+            return
+
+        try:
+            sf = salesforce_service.get_client()
+            case = sf.get_case_by_number(search_term)
+
+            if not case:
+                cases = sf.search_cases(search_term, limit=5)
+                if cases:
+                    case = cases[0]
+
+            if not case:
+                client.chat_postEphemeral(
+                    channel=channel_id,
+                    user=user_id,
+                    text=f"No case found matching '{search_term}'",
+                )
+                return
+
+            client.chat_postMessage(
+                channel=channel_id,
+                blocks=blocks.case_details_blocks(case),
+                text=f"Case {case.case_number}: {case.subject}",
+            )
+
+        except Exception as e:
+            client.chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text=f"Error looking up case: {e}",
+            )
+
+    @app.action("draft_for_case")
+    def handle_draft_for_case(ack, body, client):
+        """Open draft modal pre-filled with case details."""
+        ack()
+        sf_case_id = body["actions"][0]["value"]
+
+        try:
+            sf = salesforce_service.get_client()
+            case = sf.get_case_by_id(sf_case_id)
+
+            if not case:
+                return
+
+            client.views_open(
+                trigger_id=body["trigger_id"],
+                view=blocks.case_input_modal(
+                    sf_enabled=True,
+                    prefill_case_number=case.case_number,
+                    prefill_customer_name=case.contact_name,
+                    prefill_customer_email=case.contact_email,
+                    prefill_issue_summary=f"{case.subject}\n\n{case.description[:500] if case.description else ''}",
+                ),
+            )
+        except Exception:
+            client.views_open(
+                trigger_id=body["trigger_id"],
+                view=blocks.case_input_modal(sf_enabled=sf_enabled),
+            )
+
+    @app.action("lookup_sf_case")
+    def handle_inline_sf_lookup(ack, body, client):
+        """Handle inline SF lookup from within the draft modal."""
+        ack()
+        # Note: This action happens within the modal but Slack's block actions
+        # in modals don't allow updating the view directly. User must reopen.
+        # For now, we'll post an ephemeral message with instructions.
 
     @app.view("draft_email_modal")
     def handle_draft_submission(ack, body, client, view):
@@ -47,12 +150,28 @@ def register_handlers(app: App) -> None:
         values = view["state"]["values"]
         case_number = values["case_number_block"]["case_number"]["value"]
         customer_name = values["customer_name_block"]["customer_name"]["value"]
+        customer_email = values.get("customer_email_block", {}).get("customer_email", {}).get("value") or ""
         issue_summary = values["issue_summary_block"]["issue_summary"]["value"]
         tone = values["tone_block"]["tone"]["selected_option"]["value"]
         additional_context = values["context_block"]["additional_context"]["value"] or ""
 
         user_id = body["user"]["id"]
         channel_id = config.slack_channel_id
+
+        # Try to get SF case ID
+        sf_case_id = None
+        if sf_enabled and case_number:
+            try:
+                sf = salesforce_service.get_client()
+                case = sf.get_case_by_number(case_number)
+                if case:
+                    sf_case_id = case.id
+                    if not customer_email and case.contact_email:
+                        customer_email = case.contact_email
+                    if not customer_name and case.contact_name:
+                        customer_name = case.contact_name
+            except Exception:
+                pass
 
         # Send "generating" message
         result = client.chat_postMessage(
@@ -74,11 +193,14 @@ def register_handlers(app: App) -> None:
         draft = store.create(
             case_number=case_number,
             customer_name=customer_name,
+            customer_email=customer_email,
             subject=draft_result["subject"],
             body=draft_result["body"],
             tone=tone,
             user_id=user_id,
             channel_id=channel_id,
+            sf_case_id=sf_case_id,
+            issue_summary=issue_summary,
         )
 
         # Update message with draft
@@ -92,6 +214,9 @@ def register_handlers(app: App) -> None:
                 subject=draft_result["subject"],
                 body=draft_result["body"],
                 draft_id=draft.id,
+                customer_email=customer_email,
+                sf_case_id=sf_case_id,
+                sf_enabled=sf_enabled,
             ),
         )
         store.set_message_ts(draft.id, temp_ts)
@@ -135,7 +260,6 @@ def register_handlers(app: App) -> None:
             ],
         )
 
-        # Send ephemeral confirmation
         client.chat_postEphemeral(
             channel=draft.channel_id,
             user=body["user"]["id"],
@@ -190,6 +314,9 @@ def register_handlers(app: App) -> None:
                 subject=draft.subject,
                 body=draft.body,
                 draft_id=draft.id,
+                customer_email=draft.customer_email,
+                sf_case_id=draft.sf_case_id,
+                sf_enabled=sf_enabled,
             ),
         )
 
@@ -216,11 +343,13 @@ def register_handlers(app: App) -> None:
             ],
         )
 
-        # Regenerate (we don't have the original issue_summary stored, so we use a generic prompt)
+        # Use stored issue_summary if available
+        issue_summary = draft.issue_summary or f"(Regenerating based on previous draft about: {draft.subject})"
+
         new_draft = claude_service.draft_email(
             case_number=draft.case_number,
             customer_name=draft.customer_name,
-            issue_summary=f"(Regenerating based on previous draft about: {draft.subject})",
+            issue_summary=issue_summary,
             tone=draft.tone,
         )
 
@@ -237,6 +366,9 @@ def register_handlers(app: App) -> None:
                 subject=draft.subject,
                 body=draft.body,
                 draft_id=draft.id,
+                customer_email=draft.customer_email,
+                sf_case_id=draft.sf_case_id,
+                sf_enabled=sf_enabled,
             ),
         )
 
@@ -263,3 +395,124 @@ def register_handlers(app: App) -> None:
         )
 
         store.delete(draft_id)
+
+    # Salesforce-specific actions
+    @app.action("send_via_sf")
+    def handle_send_via_sf(ack, body, client):
+        """Send the email through Salesforce."""
+        ack()
+        draft_id = body["actions"][0]["value"]
+        draft = store.get(draft_id)
+
+        if not draft or not draft.sf_case_id or not draft.customer_email:
+            client.chat_postEphemeral(
+                channel=body["channel"]["id"],
+                user=body["user"]["id"],
+                text="Cannot send: missing case ID or customer email.",
+            )
+            return
+
+        try:
+            sf = salesforce_service.get_client()
+            email_id = sf.send_email_from_case(
+                case_id=draft.sf_case_id,
+                to_address=draft.customer_email,
+                subject=draft.subject,
+                body=draft.body,
+            )
+
+            client.chat_update(
+                channel=draft.channel_id,
+                ts=draft.message_ts,
+                text=f"Email sent for Case {draft.case_number}",
+                blocks=[
+                    {
+                        "type": "header",
+                        "text": {"type": "plain_text", "text": f"Sent: Case {draft.case_number}"},
+                    },
+                    {
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": f"*To:* {draft.customer_email}\n*Subject:* {draft.subject}"},
+                    },
+                    {"type": "divider"},
+                    {
+                        "type": "context",
+                        "elements": [
+                            {"type": "mrkdwn", "text": f"Email sent via Salesforce (ID: {email_id})"},
+                        ],
+                    },
+                ],
+            )
+
+            store.delete(draft_id)
+
+        except Exception as e:
+            client.chat_postEphemeral(
+                channel=body["channel"]["id"],
+                user=body["user"]["id"],
+                text=f"Failed to send email: {e}",
+            )
+
+    @app.action("save_sf_draft")
+    def handle_save_sf_draft(ack, body, client):
+        """Save as draft in Salesforce."""
+        ack()
+        draft_id = body["actions"][0]["value"]
+        draft = store.get(draft_id)
+
+        if not draft or not draft.sf_case_id:
+            return
+
+        try:
+            sf = salesforce_service.get_client()
+            email_id = sf.create_email_draft(
+                case_id=draft.sf_case_id,
+                to_address=draft.customer_email or "",
+                subject=draft.subject,
+                body=draft.body,
+            )
+
+            client.chat_postEphemeral(
+                channel=body["channel"]["id"],
+                user=body["user"]["id"],
+                text=f"Draft saved to Salesforce (ID: {email_id}). Open the case in SF to review and send.",
+            )
+
+        except Exception as e:
+            client.chat_postEphemeral(
+                channel=body["channel"]["id"],
+                user=body["user"]["id"],
+                text=f"Failed to save draft: {e}",
+            )
+
+    @app.action("add_case_comment")
+    def handle_add_case_comment(ack, body, client):
+        """Add the email content as a case comment."""
+        ack()
+        draft_id = body["actions"][0]["value"]
+        draft = store.get(draft_id)
+
+        if not draft or not draft.sf_case_id:
+            return
+
+        try:
+            sf = salesforce_service.get_client()
+            comment_body = f"Subject: {draft.subject}\n\n{draft.body}"
+            comment_id = sf.add_case_comment(
+                case_id=draft.sf_case_id,
+                comment_body=comment_body,
+                is_public=False,
+            )
+
+            client.chat_postEphemeral(
+                channel=body["channel"]["id"],
+                user=body["user"]["id"],
+                text=f"Added as internal comment to Case {draft.case_number} (ID: {comment_id})",
+            )
+
+        except Exception as e:
+            client.chat_postEphemeral(
+                channel=body["channel"]["id"],
+                user=body["user"]["id"],
+                text=f"Failed to add comment: {e}",
+            )
