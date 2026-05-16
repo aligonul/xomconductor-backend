@@ -47,13 +47,36 @@ class SalesforceClient:
         self._sf: Optional[Salesforce] = None
 
     def connect(self) -> bool:
-        """Establish connection to Salesforce."""
+        """Establish connection to Salesforce using available auth method."""
+        # Try OAuth first (for SSO orgs like Xometry with Okta)
+        if os.getenv("SF_ACCESS_TOKEN") and os.getenv("SF_INSTANCE_URL"):
+            return self._connect_oauth()
+
+        # Fall back to username/password (for non-SSO orgs)
+        if os.getenv("SF_USERNAME") and os.getenv("SF_PASSWORD"):
+            return self._connect_password()
+
+        raise ConnectionError("No Salesforce credentials configured")
+
+    def _connect_oauth(self) -> bool:
+        """Connect using OAuth access token."""
+        try:
+            self._sf = Salesforce(
+                instance_url=os.environ["SF_INSTANCE_URL"],
+                session_id=os.environ["SF_ACCESS_TOKEN"],
+            )
+            return True
+        except Exception as e:
+            raise ConnectionError(f"Salesforce OAuth connection failed: {e}")
+
+    def _connect_password(self) -> bool:
+        """Connect using username/password."""
         try:
             self._sf = Salesforce(
                 username=os.environ["SF_USERNAME"],
                 password=os.environ["SF_PASSWORD"],
-                security_token=os.environ["SF_SECURITY_TOKEN"],
-                domain=os.getenv("SF_DOMAIN", "login"),  # 'login' for prod, 'test' for sandbox
+                security_token=os.environ.get("SF_SECURITY_TOKEN", ""),
+                domain=os.getenv("SF_DOMAIN", "login"),
             )
             return True
         except SalesforceAuthenticationFailed as e:
@@ -67,6 +90,7 @@ class SalesforceClient:
 
     def get_case_by_number(self, case_number: str) -> Optional[CaseDetails]:
         """Fetch case details by case number."""
+        clean_number = case_number.replace("'", "").replace(";", "").strip()
         query = f"""
             SELECT Id, CaseNumber, Subject, Description, Status, Priority,
                    Contact.Name, Contact.Email,
@@ -74,7 +98,7 @@ class SalesforceClient:
                    Owner.Name,
                    CreatedDate, LastModifiedDate
             FROM Case
-            WHERE CaseNumber = '{case_number}'
+            WHERE CaseNumber = '{clean_number}'
             LIMIT 1
         """
         result = self.sf.query(query)
@@ -86,6 +110,7 @@ class SalesforceClient:
 
     def get_case_by_id(self, case_id: str) -> Optional[CaseDetails]:
         """Fetch case details by Salesforce ID."""
+        clean_id = case_id.replace("'", "").replace(";", "").strip()
         query = f"""
             SELECT Id, CaseNumber, Subject, Description, Status, Priority,
                    Contact.Name, Contact.Email,
@@ -93,7 +118,7 @@ class SalesforceClient:
                    Owner.Name,
                    CreatedDate, LastModifiedDate
             FROM Case
-            WHERE Id = '{case_id}'
+            WHERE Id = '{clean_id}'
             LIMIT 1
         """
         result = self.sf.query(query)
@@ -105,6 +130,7 @@ class SalesforceClient:
 
     def search_cases(self, search_term: str, limit: int = 10) -> list[CaseDetails]:
         """Search cases by subject or case number."""
+        clean_term = search_term.replace("'", "").replace(";", "").strip()
         query = f"""
             SELECT Id, CaseNumber, Subject, Description, Status, Priority,
                    Contact.Name, Contact.Email,
@@ -112,8 +138,8 @@ class SalesforceClient:
                    Owner.Name,
                    CreatedDate, LastModifiedDate
             FROM Case
-            WHERE CaseNumber LIKE '%{search_term}%'
-               OR Subject LIKE '%{search_term}%'
+            WHERE CaseNumber LIKE '%{clean_term}%'
+               OR Subject LIKE '%{clean_term}%'
             ORDER BY LastModifiedDate DESC
             LIMIT {limit}
         """
@@ -177,9 +203,16 @@ def get_client() -> SalesforceClient:
 
 
 def is_configured() -> bool:
-    """Check if Salesforce credentials are configured."""
-    return all([
-        os.getenv("SF_USERNAME"),
-        os.getenv("SF_PASSWORD"),
-        os.getenv("SF_SECURITY_TOKEN"),
-    ])
+    """Check if Salesforce credentials are configured (either OAuth or password)."""
+    oauth_configured = os.getenv("SF_ACCESS_TOKEN") and os.getenv("SF_INSTANCE_URL")
+    password_configured = os.getenv("SF_USERNAME") and os.getenv("SF_PASSWORD")
+    return bool(oauth_configured or password_configured)
+
+
+def get_auth_method() -> str:
+    """Return which auth method is configured."""
+    if os.getenv("SF_ACCESS_TOKEN") and os.getenv("SF_INSTANCE_URL"):
+        return "oauth"
+    if os.getenv("SF_USERNAME") and os.getenv("SF_PASSWORD"):
+        return "password"
+    return "none"

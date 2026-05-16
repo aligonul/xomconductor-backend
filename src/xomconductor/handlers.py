@@ -1,8 +1,9 @@
 """Slack event and action handlers."""
 
+import os
 from slack_bolt import App
 
-from . import blocks, claude_service, salesforce_service
+from . import blocks, claude_service, salesforce_service, gmail_service
 from .config import config
 from .draft_store import store
 
@@ -11,6 +12,8 @@ def register_handlers(app: App) -> None:
     """Register all Slack handlers with the app."""
 
     sf_enabled = salesforce_service.is_configured()
+    gmail_enabled = gmail_service.is_configured()
+    default_cc = os.getenv("GMAIL_DEFAULT_CC", "global_cms@xometry.com")
 
     @app.event("app_home_opened")
     def handle_app_home(client, event):
@@ -217,6 +220,8 @@ def register_handlers(app: App) -> None:
                 customer_email=customer_email,
                 sf_case_id=sf_case_id,
                 sf_enabled=sf_enabled,
+                gmail_enabled=gmail_enabled,
+                default_cc=default_cc,
             ),
         )
         store.set_message_ts(draft.id, temp_ts)
@@ -317,6 +322,8 @@ def register_handlers(app: App) -> None:
                 customer_email=draft.customer_email,
                 sf_case_id=draft.sf_case_id,
                 sf_enabled=sf_enabled,
+                gmail_enabled=gmail_enabled,
+                default_cc=default_cc,
             ),
         )
 
@@ -369,6 +376,8 @@ def register_handlers(app: App) -> None:
                 customer_email=draft.customer_email,
                 sf_case_id=draft.sf_case_id,
                 sf_enabled=sf_enabled,
+                gmail_enabled=gmail_enabled,
+                default_cc=default_cc,
             ),
         )
 
@@ -515,4 +524,60 @@ def register_handlers(app: App) -> None:
                 channel=body["channel"]["id"],
                 user=body["user"]["id"],
                 text=f"Failed to add comment: {e}",
+            )
+
+    # Gmail action
+    @app.action("send_via_gmail")
+    def handle_send_via_gmail(ack, body, client):
+        """Send the email via Gmail SMTP."""
+        ack()
+        draft_id = body["actions"][0]["value"]
+        draft = store.get(draft_id)
+
+        if not draft or not draft.customer_email:
+            client.chat_postEphemeral(
+                channel=body["channel"]["id"],
+                user=body["user"]["id"],
+                text="Cannot send: missing customer email.",
+            )
+            return
+
+        result = gmail_service.send_email(
+            to_address=draft.customer_email,
+            subject=draft.subject,
+            body=draft.body,
+        )
+
+        if result.success:
+            client.chat_update(
+                channel=draft.channel_id,
+                ts=draft.message_ts,
+                text=f"Email sent for Case {draft.case_number}",
+                blocks=[
+                    {
+                        "type": "header",
+                        "text": {"type": "plain_text", "text": f"Sent: Case {draft.case_number}"},
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*To:* {draft.customer_email}\n*CC:* {default_cc}\n*Subject:* {draft.subject}",
+                        },
+                    },
+                    {"type": "divider"},
+                    {
+                        "type": "context",
+                        "elements": [
+                            {"type": "mrkdwn", "text": "Email sent via Gmail"},
+                        ],
+                    },
+                ],
+            )
+            store.delete(draft_id)
+        else:
+            client.chat_postEphemeral(
+                channel=body["channel"]["id"],
+                user=body["user"]["id"],
+                text=f"Failed to send email: {result.error}",
             )

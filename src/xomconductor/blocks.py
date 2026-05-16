@@ -166,6 +166,8 @@ def email_draft_blocks(
     customer_email: Optional[str] = None,
     sf_case_id: Optional[str] = None,
     sf_enabled: bool = False,
+    gmail_enabled: bool = False,
+    default_cc: Optional[str] = None,
 ) -> list:
     """Blocks displaying an email draft with action buttons."""
     to_text = f"*To:* {customer_name}"
@@ -262,6 +264,32 @@ def email_draft_blocks(
                     "text": {"type": "plain_text", "text": "Add as Case Comment"},
                     "action_id": "add_case_comment",
                     "value": draft_id,
+                },
+            ],
+        })
+
+    # Gmail send option
+    if gmail_enabled and customer_email:
+        cc_text = f" (CC: {default_cc})" if default_cc else ""
+        blocks.append({
+            "type": "actions",
+            "block_id": f"gmail_actions_{draft_id}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Send via Gmail"},
+                    "style": "primary",
+                    "action_id": "send_via_gmail",
+                    "value": draft_id,
+                    "confirm": {
+                        "title": {"type": "plain_text", "text": "Send Email?"},
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"This will send the email to *{customer_email}*{cc_text} via Gmail.",
+                        },
+                        "confirm": {"type": "plain_text", "text": "Send"},
+                        "deny": {"type": "plain_text", "text": "Cancel"},
+                    },
                 },
             ],
         })
